@@ -665,18 +665,26 @@ class SajApiClient:
                     except (ValueError, TypeError):
                         pass
             elif not is_nighttime:
-                # Fall back to realtime/history data if load monitoring is unavailable
-                _LOGGER.debug("%s data totalGridPowerWatt: %s", 
-                            "Realtime" if is_realtime else "History", 
+                # Fall back to realtime/history data if load monitoring is unavailable.
+                # For R6 solar devices the API reports totalGridPowerWatt as a positive
+                # magnitude and gridDirection=-1 when exporting (matching the SAJ app).
+                _LOGGER.debug("%s data totalGridPowerWatt: %s",
+                            "Realtime" if is_realtime else "History",
                             data.get('totalGridPowerWatt'))
                 try:
                     grid_power = float(data.get('totalGridPowerWatt', 0))
-                    grid_direction = "exporting" if grid_power < 0 else "importing" if grid_power > 0 else "idle"
+                    grid_direction_value = int(float(data.get('gridDirection', 0)))
+                    if grid_direction_value == -1:
+                        grid_direction = "exporting"
+                    elif grid_direction_value == 1:
+                        grid_direction = "importing" if grid_power >= 0 else "exporting"
+                    else:
+                        grid_direction = "exporting" if grid_power < 0 else "importing" if grid_power > 0 else "idle"
                     processed["grid_status_calculated"] = grid_direction
                     processed["grid_power_abs"] = abs(grid_power)
                 except (ValueError, TypeError):
                     pass
-            
+
             # Process home load power - prioritize load monitoring data
             _LOGGER.debug("--- LOAD DATA ---")
             if load_monitoring:
@@ -689,11 +697,25 @@ class SajApiClient:
                         processed["home_load_power"] = load_power
                     except (ValueError, TypeError):
                         pass
-            elif not is_nighttime and "totalLoadPowerWatt" in data:
-                # Fall back to realtime/history data if load monitoring is unavailable
+            elif not is_nighttime:
+                # SAJ R6 realtime/history often leaves totalLoadPowerWatt/sysTotalLoadWatt
+                # at 0 even though the app displays Total load as PV power minus exported
+                # grid power. Use the explicit load field if non-zero; otherwise estimate
+                # instantaneous load from the power balance.
                 try:
-                    load_power = float(data.get("totalLoadPowerWatt", 0))
-                    processed["home_load_power"] = load_power
+                    explicit_load = float(data.get("totalLoadPowerWatt") or data.get("sysTotalLoadWatt") or 0)
+                    if explicit_load > 0:
+                        processed["home_load_power"] = explicit_load
+                    else:
+                        pv_power = float(data.get("totalPVPower", processed.get("total_pv_power_calculated", 0)) or 0)
+                        grid_abs = float(processed.get("grid_power_abs", abs(float(data.get("totalGridPowerWatt", 0) or 0))))
+                        grid_status = processed.get("grid_status_calculated")
+                        if grid_status == "exporting":
+                            processed["home_load_power"] = max(pv_power - grid_abs, 0)
+                            processed["home_load_power_estimated"] = True
+                        elif grid_status == "importing":
+                            processed["home_load_power"] = max(pv_power + grid_abs, 0)
+                            processed["home_load_power_estimated"] = True
                 except (ValueError, TypeError):
                     pass
             

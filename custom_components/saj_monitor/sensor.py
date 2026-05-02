@@ -1522,11 +1522,12 @@ class SajHomeLoadPowerSensor(SajBaseSensor):
        device_type = device_data.get("device_type")
        processed_data = self._get_processed_data()
 
-       # For battery devices, try processed data which includes realtime data
-       if device_type == DEVICE_TYPE_BATTERY and "home_load_power" in processed_data:
+       # For all device types, prefer processed data. For R6 solar this may be
+       # an estimated instantaneous load from PV minus exported grid power,
+       # matching the SAJ app when load-monitoring/secData is unavailable.
+       if "home_load_power" in processed_data:
            return processed_data["home_load_power"]
 
-       # For non-battery devices or if realtime data is not available
        # First try load monitoring data
        if "load_monitoring" in device_data and device_data["load_monitoring"]:
            latest = device_data["load_monitoring"].get("latest", {})
@@ -1786,7 +1787,13 @@ class SajTodayInverterLoadEnergySensor(SajBaseSensor):
        for source in (self._get_plant_stats(), self._get_realtime_data(), self._get_history_data()):
            if "todayLoadEnergy" in source:
                try:
-                   return float(source["todayLoadEnergy"])
+                   value = float(source["todayLoadEnergy"])
+                   # For solar/R6, SAJ can return a false zero when load monitoring
+                   # is unavailable even while realtime power balance shows load.
+                   # Do not publish that as a real total_increasing energy value.
+                   if device_data.get("device_type") == DEVICE_TYPE_SOLAR and value == 0:
+                       continue
+                   return value
                except (ValueError, TypeError):
                    pass
 
