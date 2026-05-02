@@ -672,16 +672,21 @@ class SajApiClient:
                             "Realtime" if is_realtime else "History",
                             data.get('totalGridPowerWatt'))
                 try:
-                    grid_power = float(data.get('totalGridPowerWatt', 0))
+                    total_grid_power = abs(float(data.get('totalGridPowerWatt', 0) or 0))
+                    sys_grid_power = abs(float(data.get('sysGridPowerWatt', 0) or 0))
+                    # SAJ R6 can report totalGridPowerWatt as per-phase/partial (~4 kW)
+                    # while the app's grid bubble uses sysGridPowerWatt/whole-site export
+                    # (~13 kW). Use the larger magnitude for power-balance load estimates.
+                    grid_power = max(total_grid_power, sys_grid_power)
                     grid_direction_value = int(float(data.get('gridDirection', 0)))
                     if grid_direction_value == -1:
                         grid_direction = "exporting"
                     elif grid_direction_value == 1:
-                        grid_direction = "importing" if grid_power >= 0 else "exporting"
+                        grid_direction = "importing"
                     else:
-                        grid_direction = "exporting" if grid_power < 0 else "importing" if grid_power > 0 else "idle"
+                        grid_direction = "exporting" if float(data.get('totalGridPowerWatt', 0) or 0) < 0 else "importing" if grid_power > 0 else "idle"
                     processed["grid_status_calculated"] = grid_direction
-                    processed["grid_power_abs"] = abs(grid_power)
+                    processed["grid_power_abs"] = grid_power
                 except (ValueError, TypeError):
                     pass
 
