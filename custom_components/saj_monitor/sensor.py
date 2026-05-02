@@ -400,9 +400,13 @@ class SajTodayEnergySensor(SajBaseSensor):
             
             return None
 
-        # For solar devices, use load monitoring data exclusively
-        if device_type == DEVICE_TYPE_SOLAR and "load_monitoring" in device_data:
-            load_monitoring = device_data["load_monitoring"]
+        # For solar devices, prefer load monitoring data when available, but
+        # fall back to realtime/history/plant statistics. The SAJ secData
+        # endpoint can return code 10001 (system error) for some solar plants,
+        # which used to force this sensor to 0 even while the inverter was
+        # generating and plant_stats.todayPvEnergy had the correct value.
+        if device_type == DEVICE_TYPE_SOLAR:
+            load_monitoring = device_data.get("load_monitoring")
             if load_monitoring and "total" in load_monitoring:
                 total = load_monitoring["total"]
                 if "pvEnergy" in total:
@@ -411,11 +415,30 @@ class SajTodayEnergySensor(SajBaseSensor):
                         return float(total["pvEnergy"])
                     except (ValueError, TypeError):
                         pass
-            
-            # If load monitoring data is not available or doesn't have the value,
-            # return 0 instead of falling back to other data sources
-            return 0
-            
+
+            realtime_data = self._get_realtime_data()
+            if "todayPvEnergy" in realtime_data:
+                try:
+                    return float(realtime_data["todayPvEnergy"])
+                except (ValueError, TypeError):
+                    pass
+
+            history_data = self._get_history_data()
+            if "todayPvEnergy" in history_data:
+                try:
+                    return float(history_data["todayPvEnergy"])
+                except (ValueError, TypeError):
+                    pass
+
+            plant_stats = self._get_plant_stats()
+            if "todayPvEnergy" in plant_stats:
+                try:
+                    return float(plant_stats["todayPvEnergy"])
+                except (ValueError, TypeError):
+                    pass
+
+            return None
+
         return None
 
 class SajTotalEnergySensor(SajBaseSensor):
@@ -749,9 +772,11 @@ class SajTodayGridExportSensor(SajBaseSensor):
                 
             return None
         
-        # For solar devices, use load monitoring data exclusively
-        if device_type == DEVICE_TYPE_SOLAR and "load_monitoring" in device_data:
-            load_monitoring = device_data["load_monitoring"]
+        # For solar devices, prefer load monitoring data when available, but
+        # fall back to plant/realtime/history stats. SAJ secData can return
+        # code 10001 with no data; plant_stats.todaySellEnergy remains valid.
+        if device_type == DEVICE_TYPE_SOLAR:
+            load_monitoring = device_data.get("load_monitoring")
             if load_monitoring and "total" in load_monitoring:
                 total = load_monitoring["total"]
                 if "sellEnergy" in total:
@@ -759,11 +784,16 @@ class SajTodayGridExportSensor(SajBaseSensor):
                         return float(total["sellEnergy"])
                     except (ValueError, TypeError):
                         pass
-            
-            # If load monitoring data is not available or doesn't have the value,
-            # return 0 instead of falling back to other data sources
-            return 0
-            
+
+            for source in (self._get_plant_stats(), self._get_realtime_data(), self._get_history_data()):
+                if "todaySellEnergy" in source:
+                    try:
+                        return float(source["todaySellEnergy"])
+                    except (ValueError, TypeError):
+                        pass
+
+            return None
+
         return None
 
 class SajTotalGridExportSensor(SajBaseSensor):
@@ -795,6 +825,17 @@ class SajTotalGridExportSensor(SajBaseSensor):
             if "total_grid_export" in processed_data:
                 return processed_data["total_grid_export"]
         
+        # For solar devices, plant statistics are more reliable than secData/history
+        # when SAJ load monitoring is unavailable or broken.
+        if device_type == DEVICE_TYPE_SOLAR:
+            for source in (self._get_plant_stats(), self._get_realtime_data(), self._get_history_data()):
+                if "totalSellEnergy" in source:
+                    try:
+                        return float(source["totalSellEnergy"])
+                    except (ValueError, TypeError):
+                        pass
+            return None
+
         # For non-battery devices, try history data first
         history_data = self._get_history_data()
         if "totalSellEnergy" in history_data:
@@ -1647,9 +1688,11 @@ class SajTodayGridImportEnergySensor(SajBaseSensor):
            processed_data = self._get_processed_data()
            return processed_data.get("today_grid_import_energy")
        
-       # For solar devices, use load monitoring data exclusively
-       if device_type == DEVICE_TYPE_SOLAR and "load_monitoring" in device_data:
-           load_monitoring = device_data["load_monitoring"]
+       # For solar devices, prefer load monitoring data when available, but
+       # fall back to plant/realtime/history stats. A real zero import remains 0;
+       # a missing secData response should not be the only source.
+       if device_type == DEVICE_TYPE_SOLAR:
+           load_monitoring = device_data.get("load_monitoring")
            if load_monitoring and "total" in load_monitoring:
                total = load_monitoring["total"]
                if "buyEnergy" in total:
@@ -1657,11 +1700,16 @@ class SajTodayGridImportEnergySensor(SajBaseSensor):
                        return float(total["buyEnergy"])
                    except (ValueError, TypeError):
                        pass
-           
-           # If load monitoring data is not available or doesn't have the value,
-           # return 0 instead of falling back to other data sources
-           return 0
-           
+
+           for source in (self._get_plant_stats(), self._get_realtime_data(), self._get_history_data()):
+               if "todayBuyEnergy" in source:
+                   try:
+                       return float(source["todayBuyEnergy"])
+                   except (ValueError, TypeError):
+                       pass
+
+           return None
+
        return None
 
 class SajTotalGridImportSensor(SajBaseSensor):
@@ -1717,7 +1765,8 @@ class SajTodayInverterLoadEnergySensor(SajBaseSensor):
        """Return the state of the sensor."""
        device_data = self._get_device_data()
        
-       # Get load monitoring data
+       # Prefer load monitoring data, then fall back to plant/realtime/history stats.
+       # If the upstream plant stats report 0.0, keep that real zero.
        if "load_monitoring" in device_data and device_data["load_monitoring"]:
            total = device_data["load_monitoring"].get("total", {})
            if "loadEnergy" in total:
@@ -1725,10 +1774,15 @@ class SajTodayInverterLoadEnergySensor(SajBaseSensor):
                    return float(total["loadEnergy"])
                except (ValueError, TypeError):
                    pass
-       
-       # If load monitoring data is not available or doesn't have the value,
-       # return 0 instead of returning None
-       return 0
+
+       for source in (self._get_plant_stats(), self._get_realtime_data(), self._get_history_data()):
+           if "todayLoadEnergy" in source:
+               try:
+                   return float(source["todayLoadEnergy"])
+               except (ValueError, TypeError):
+                   pass
+
+       return None
 
 # Online status sensor moved to binary_sensor.py
 
