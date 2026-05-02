@@ -244,6 +244,14 @@ class SajBaseSensor(CoordinatorEntity, SensorEntity):
             return {}
         plant_stats = device_data.get("plant_stats") or {}
         return plant_stats if isinstance(plant_stats, dict) else {}
+
+    def _get_realtime_data(self):
+        """Get realtime data from coordinator."""
+        device_data = self._get_device_data()
+        if not device_data:
+            return {}
+        realtime_data = device_data.get("realtime_data") or {}
+        return realtime_data if isinstance(realtime_data, dict) else {}
     
     def _get_processed_data(self):
         """Get processed data from coordinator."""
