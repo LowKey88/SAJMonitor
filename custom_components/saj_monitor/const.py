@@ -1,6 +1,6 @@
 """Constants for the SAJ Solar & Battery Monitor integration."""
 
-DOMAIN = "saj"
+DOMAIN = "saj_monitor"
 CONF_APP_ID = "app_id"
 CONF_APP_SECRET = "app_secret"
 
