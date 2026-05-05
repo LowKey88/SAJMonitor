@@ -2,6 +2,12 @@
 
 All notable changes to SAJ Monitor are documented in this file.
 
+## 0.1.4 - 2026-05-05
+
+### Added
+
+- Added local Home Assistant brand images under `custom_components/saj_monitor/brand/` so the custom integration page can show a SAJ Monitor icon/logo on Home Assistant 2026.3+.
+
 ## 0.1.3 - 2026-05-05
 
 ### Added
