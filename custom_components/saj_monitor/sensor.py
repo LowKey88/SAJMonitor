@@ -1,7 +1,10 @@
 """Sensor platform for SAJ Solar & Battery Monitor integration."""
 import logging
+from datetime import datetime
 from typing import Dict, List, Any, Optional
 import asyncio
+
+from homeassistant.util import dt as dt_util
 
 
 # Import the constants first to avoid blocking
@@ -47,6 +50,67 @@ from homeassistant.const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+# Domestic ToU + NEM estimate based on the user's April 2026 TNB bill.
+# Bill profile (redacted): Domestic ToU, 245 kWh peak + 846 kWh off-peak,
+# AFA -RM0.0047/kWh from 2026-04-01, capacity RM0.0455/kWh,
+# network RM0.1285/kWh, retail RM10/month, ST RM17.12, KWTBB RM5.99.
+# SAJ SEC currently exposes only daily total buyEnergy/sellEnergy, not ToU buckets,
+# so peak/off-peak are estimated using the observed bill mix.
+TNB_TOU_PEAK_RATE_RM_PER_KWH = 0.2852
+TNB_TOU_OFFPEAK_RATE_RM_PER_KWH = 0.2443
+TNB_AFA_RATE_RM_PER_KWH = -0.0047
+TNB_AFA_EFFECTIVE_RATE_RM_PER_KWH = -4.19 / 1091
+TNB_CAPACITY_RATE_RM_PER_KWH = 0.0455
+TNB_NETWORK_RATE_RM_PER_KWH = 0.1285
+TNB_RETAIL_CHARGE_RM_PER_MONTH = 10.00
+TNB_ESTIMATED_BILL_DAYS = 30
+TNB_SERVICE_TAX_EFFECTIVE_RM_PER_KWH = 17.12 / 1091
+TNB_KWTBB_EFFECTIVE_RM_PER_KWH = 5.99 / 1091
+TNB_TOU_PEAK_SHARE = 245 / 1091
+TNB_TOU_OFFPEAK_SHARE = 846 / 1091
+TNB_TOU_ENERGY_BLEND_RATE_RM_PER_KWH = (
+    TNB_TOU_PEAK_SHARE * TNB_TOU_PEAK_RATE_RM_PER_KWH
+    + TNB_TOU_OFFPEAK_SHARE * TNB_TOU_OFFPEAK_RATE_RM_PER_KWH
+)
+TNB_TOU_IMPORT_VARIABLE_RATE_RM_PER_KWH = (
+    TNB_TOU_ENERGY_BLEND_RATE_RM_PER_KWH
+    + TNB_AFA_EFFECTIVE_RATE_RM_PER_KWH
+    + TNB_CAPACITY_RATE_RM_PER_KWH
+    + TNB_NETWORK_RATE_RM_PER_KWH
+)
+TNB_NEM_EXPORT_CREDIT_RATE_RM_PER_KWH = (
+    TNB_TOU_ENERGY_BLEND_RATE_RM_PER_KWH
+    + TNB_CAPACITY_RATE_RM_PER_KWH
+    + TNB_NETWORK_RATE_RM_PER_KWH
+)
+TNB_RETAIL_CHARGE_RM_PER_DAY = TNB_RETAIL_CHARGE_RM_PER_MONTH / TNB_ESTIMATED_BILL_DAYS
+
+
+def _as_float(value):
+    """Return a float or None for SAJ numeric values."""
+    try:
+        if value is None or value == "":
+            return None
+        return float(value)
+    except (ValueError, TypeError):
+        return None
+
+
+def _parse_saj_data_time(value):
+    """Parse SAJ local dataTime into a timezone-aware datetime."""
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        try:
+            parsed = datetime.strptime(str(value), "%Y-%m-%d %H:%M:%S")
+        except (ValueError, TypeError):
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt_util.DEFAULT_TIME_ZONE)
+    return parsed
 
 async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
@@ -107,9 +171,17 @@ async def async_setup_entry(
             SajHomeLoadPowerSensor(coordinator, device_sn, device_name),
         ])
         
-        # Add inverter-specific load energy sensor for solar devices
+        # Add inverter-specific load energy and SEC/KPI sensors for solar devices
         if device_type == DEVICE_TYPE_SOLAR:
-            entities.append(SajTodayInverterLoadEnergySensor(coordinator, device_sn, device_name))
+            entities.extend([
+                SajTodayInverterLoadEnergySensor(coordinator, device_sn, device_name),
+                SajSecLastDataTimeSensor(coordinator, device_sn, device_name),
+                SajSecDataAgeSensor(coordinator, device_sn, device_name),
+                SajSecLoadSelfConsumedEnergySensor(coordinator, device_sn, device_name),
+                SajSecSelfConsumptionRateSensor(coordinator, device_sn, device_name),
+                SajSecSolarOffsetRateSensor(coordinator, device_sn, device_name),
+                SajEstimatedTnbImportCostSensor(coordinator, device_sn, device_name),
+            ])
         
         # Add solar-specific entities
         if device_type == DEVICE_TYPE_SOLAR:
@@ -260,6 +332,14 @@ class SajBaseSensor(CoordinatorEntity, SensorEntity):
             return {}
         processed_data = device_data.get("processed_data") or {}
         return processed_data if isinstance(processed_data, dict) else {}
+
+    def _get_load_monitoring_data(self):
+        """Get SEC/load monitoring data from coordinator."""
+        device_data = self._get_device_data()
+        if not device_data:
+            return {}
+        load_monitoring = device_data.get("load_monitoring") or {}
+        return load_monitoring if isinstance(load_monitoring, dict) else {}
 
 class SajPlantNameSensor(SajBaseSensor):
     """Sensor for SAJ plant name."""
@@ -1498,6 +1578,244 @@ class SajTodayLoadEnergySensor(SajBaseSensor):
        processed_data = self._get_processed_data()
        return processed_data.get("today_load_energy")
 
+class SajSecLastDataTimeSensor(SajBaseSensor):
+   """Sensor for SEC last data timestamp."""
+
+   def __init__(self, coordinator, device_sn, device_name):
+       """Initialize the sensor."""
+       super().__init__(
+           coordinator=coordinator,
+           device_sn=device_sn,
+           device_name=device_name,
+           name_suffix="SEC Last Data Time",
+           unique_id_suffix="sec_last_data_time",
+           icon="mdi:clock-check-outline",
+           device_class=SensorDeviceClass.TIMESTAMP,
+       )
+
+   @property
+   def native_value(self):
+       """Return the SEC latest data timestamp."""
+       latest = self._get_load_monitoring_data().get("latest", {})
+       return _parse_saj_data_time(latest.get("dataTime"))
+
+   @property
+   def extra_state_attributes(self):
+       """Return SEC diagnostic attributes."""
+       load_monitoring = self._get_load_monitoring_data()
+       attrs = {}
+       module_sn = load_monitoring.get("module_sn")
+       if module_sn:
+           attrs["module_sn"] = module_sn
+       latest = load_monitoring.get("latest", {})
+       if latest.get("dataTime"):
+           attrs["data_time_raw"] = latest.get("dataTime")
+       return attrs
+
+class SajSecDataAgeSensor(SajBaseSensor):
+   """Sensor for SEC data age in minutes."""
+
+   def __init__(self, coordinator, device_sn, device_name):
+       """Initialize the sensor."""
+       super().__init__(
+           coordinator=coordinator,
+           device_sn=device_sn,
+           device_name=device_name,
+           name_suffix="SEC Data Age",
+           unique_id_suffix="sec_data_age",
+           icon="mdi:timer-sand",
+           state_class=SensorStateClass.MEASUREMENT,
+           unit_of_measurement="min",
+       )
+
+   @property
+   def native_value(self):
+       """Return minutes since latest SEC data point."""
+       latest = self._get_load_monitoring_data().get("latest", {})
+       parsed = _parse_saj_data_time(latest.get("dataTime"))
+       if not parsed:
+           return None
+       age_minutes = (dt_util.now() - parsed).total_seconds() / 60
+       return round(max(age_minutes, 0), 1)
+
+class SajSecLoadSelfConsumedEnergySensor(SajBaseSensor):
+   """Sensor for today's load supplied directly by PV/self-consumption."""
+
+   def __init__(self, coordinator, device_sn, device_name):
+       """Initialize the sensor."""
+       super().__init__(
+           coordinator=coordinator,
+           device_sn=device_sn,
+           device_name=device_name,
+           name_suffix="SEC Load Self Consumed Energy",
+           unique_id_suffix="sec_load_self_consumed_energy",
+           icon="mdi:solar-power-variant-outline",
+           device_class=SensorDeviceClass.ENERGY,
+           state_class=SensorStateClass.TOTAL_INCREASING,
+           unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+       )
+
+   @property
+   def native_value(self):
+       """Return today's load self-consumed energy from SEC totals."""
+       total = self._get_load_monitoring_data().get("total", {})
+       return _as_float(total.get("loadSelfConsumedEnergy"))
+
+class SajSecSelfConsumptionRateSensor(SajBaseSensor):
+   """Sensor for PV self-consumption percentage."""
+
+   def __init__(self, coordinator, device_sn, device_name):
+       """Initialize the sensor."""
+       super().__init__(
+           coordinator=coordinator,
+           device_sn=device_sn,
+           device_name=device_name,
+           name_suffix="SEC Self Consumption Rate",
+           unique_id_suffix="sec_self_consumption_rate",
+           icon="mdi:solar-power",
+           state_class=SensorStateClass.MEASUREMENT,
+           unit_of_measurement=PERCENTAGE,
+       )
+
+   @property
+   def native_value(self):
+       """Return how much PV generation was consumed locally."""
+       total = self._get_load_monitoring_data().get("total", {})
+       rate = _as_float(total.get("pvSelfConsumedRate"))
+       if rate is not None:
+           return round(rate * 100, 1)
+       pv_energy = _as_float(total.get("pvEnergy"))
+       pv_self = _as_float(total.get("pvSelfConsumedEnergy"))
+       if pv_energy and pv_self is not None:
+           return round((pv_self / pv_energy) * 100, 1)
+       return None
+
+class SajSecSolarOffsetRateSensor(SajBaseSensor):
+   """Sensor for today's home load supplied by solar percentage."""
+
+   def __init__(self, coordinator, device_sn, device_name):
+       """Initialize the sensor."""
+       super().__init__(
+           coordinator=coordinator,
+           device_sn=device_sn,
+           device_name=device_name,
+           name_suffix="SEC Solar Offset Rate",
+           unique_id_suffix="sec_solar_offset_rate",
+           icon="mdi:home-lightning-bolt-outline",
+           state_class=SensorStateClass.MEASUREMENT,
+           unit_of_measurement=PERCENTAGE,
+       )
+
+   @property
+   def native_value(self):
+       """Return how much home load was supplied by solar."""
+       total = self._get_load_monitoring_data().get("total", {})
+       rate = _as_float(total.get("loadSelfConsumedRate"))
+       if rate is not None:
+           return round(rate * 100, 1)
+       load_energy = _as_float(total.get("loadEnergy"))
+       load_self = _as_float(total.get("loadSelfConsumedEnergy"))
+       if load_energy and load_self is not None:
+           return round((load_self / load_energy) * 100, 1)
+       return None
+
+class SajEstimatedTnbImportCostSensor(SajBaseSensor):
+   """Sensor for estimated Domestic ToU/NEM bill impact from SEC import/export."""
+
+   def __init__(self, coordinator, device_sn, device_name):
+       """Initialize the sensor."""
+       super().__init__(
+           coordinator=coordinator,
+           device_sn=device_sn,
+           device_name=device_name,
+           name_suffix="Estimated TNB ToU NEM Cost Today",
+           unique_id_suffix="estimated_tnb_tou_nem_cost_today",
+           icon=MONEY_ICON,
+           state_class=SensorStateClass.MEASUREMENT,
+           unit_of_measurement="RM",
+       )
+
+   def _estimate_costs(self):
+       """Estimate today's Domestic ToU/NEM cost from SEC totals.
+
+       SAJ SEC exposes only daily total import/export kWh. We estimate the ToU
+       split from the user's April 2026 TNB Domestic ToU bill mix and then apply
+       NEM export credit against the variable import charges.
+       """
+       total = self._get_load_monitoring_data().get("total", {})
+       buy_energy = _as_float(total.get("buyEnergy"))
+       sell_energy = _as_float(total.get("sellEnergy"))
+       if buy_energy is None:
+           return None
+       sell_energy = sell_energy or 0
+
+       gross_import_variable = buy_energy * TNB_TOU_IMPORT_VARIABLE_RATE_RM_PER_KWH
+       nem_export_credit = sell_energy * TNB_NEM_EXPORT_CREDIT_RATE_RM_PER_KWH
+       net_nem_variable = gross_import_variable - nem_export_credit
+
+       service_tax_estimate = buy_energy * TNB_SERVICE_TAX_EFFECTIVE_RM_PER_KWH
+       kwtbb_estimate = buy_energy * TNB_KWTBB_EFFECTIVE_RM_PER_KWH
+       retail_estimate = TNB_RETAIL_CHARGE_RM_PER_DAY if buy_energy > 0 else 0
+       estimated_payable = max(
+           net_nem_variable + service_tax_estimate + kwtbb_estimate + retail_estimate,
+           0,
+       )
+
+       return {
+           "buy_energy_kwh": buy_energy,
+           "sell_energy_kwh": sell_energy,
+           "gross_import_variable_rm": gross_import_variable,
+           "nem_export_credit_rm": nem_export_credit,
+           "net_nem_variable_rm": net_nem_variable,
+           "service_tax_estimate_rm": service_tax_estimate,
+           "kwtbb_estimate_rm": kwtbb_estimate,
+           "retail_estimate_rm": retail_estimate,
+           "estimated_payable_rm": estimated_payable,
+       }
+
+   @property
+   def native_value(self):
+       """Return estimated payable amount after Domestic ToU/NEM assumptions."""
+       estimate = self._estimate_costs()
+       if estimate is None:
+           return None
+       return round(estimate["estimated_payable_rm"], 2)
+
+   @property
+   def extra_state_attributes(self):
+       """Return cost-estimate assumptions and intermediate values."""
+       estimate = self._estimate_costs()
+       if estimate is None:
+           return {"source": "sec_buyEnergy_sellEnergy", "estimated": True}
+       return {
+           "source": "sec_buyEnergy_sellEnergy",
+           "estimated": True,
+           "tariff_model": "TNB Domestic ToU + NEM (April 2026 bill-derived blend)",
+           "note": (
+               "Estimate only: SAJ SEC gives total daily import/export, not peak/off-peak split; "
+               "uses April bill ToU mix and bill-derived effective ST/KWTBB."
+           ),
+           "buy_energy_kwh": round(estimate["buy_energy_kwh"], 3),
+           "sell_energy_kwh": round(estimate["sell_energy_kwh"], 3),
+           "peak_share": round(TNB_TOU_PEAK_SHARE, 4),
+           "offpeak_share": round(TNB_TOU_OFFPEAK_SHARE, 4),
+           "peak_rate_rm_per_kwh": TNB_TOU_PEAK_RATE_RM_PER_KWH,
+           "offpeak_rate_rm_per_kwh": TNB_TOU_OFFPEAK_RATE_RM_PER_KWH,
+           "energy_blend_rate_rm_per_kwh": round(TNB_TOU_ENERGY_BLEND_RATE_RM_PER_KWH, 6),
+           "afa_official_rate_rm_per_kwh": TNB_AFA_RATE_RM_PER_KWH,
+           "afa_effective_rate_rm_per_kwh": round(TNB_AFA_EFFECTIVE_RATE_RM_PER_KWH, 6),
+           "capacity_rate_rm_per_kwh": TNB_CAPACITY_RATE_RM_PER_KWH,
+           "network_rate_rm_per_kwh": TNB_NETWORK_RATE_RM_PER_KWH,
+           "import_variable_rate_rm_per_kwh": round(TNB_TOU_IMPORT_VARIABLE_RATE_RM_PER_KWH, 6),
+           "nem_export_credit_rate_rm_per_kwh": round(TNB_NEM_EXPORT_CREDIT_RATE_RM_PER_KWH, 6),
+           "gross_import_variable_rm": round(estimate["gross_import_variable_rm"], 2),
+           "nem_export_credit_rm": round(estimate["nem_export_credit_rm"], 2),
+           "net_nem_variable_rm": round(estimate["net_nem_variable_rm"], 2),
+           "service_tax_estimate_rm": round(estimate["service_tax_estimate_rm"], 2),
+           "kwtbb_estimate_rm": round(estimate["kwtbb_estimate_rm"], 2),
+           "retail_estimate_rm": round(estimate["retail_estimate_rm"], 2),
+       }
+
 class SajHomeLoadPowerSensor(SajBaseSensor):
    """Sensor for SAJ home load power."""
 
@@ -1514,6 +1832,29 @@ class SajHomeLoadPowerSensor(SajBaseSensor):
            state_class=SensorStateClass.MEASUREMENT,
            unit_of_measurement=UnitOfPower.WATT,
        )
+
+   @property
+   def extra_state_attributes(self):
+       """Return diagnostic attributes for the home load source."""
+       processed_data = self._get_processed_data()
+       attrs = {}
+
+       source = processed_data.get("home_load_power_source")
+       if source:
+           attrs["source"] = source
+
+       if "home_load_power_estimated" in processed_data:
+           attrs["estimated"] = bool(processed_data["home_load_power_estimated"])
+
+       if source == "estimated_pv_grid":
+           if "total_pv_power_calculated" in processed_data:
+               attrs["estimated_from_pv_power_w"] = processed_data["total_pv_power_calculated"]
+           if "grid_power_abs" in processed_data:
+               attrs["estimated_from_grid_power_w"] = processed_data["grid_power_abs"]
+           if "grid_status_calculated" in processed_data:
+               attrs["estimated_grid_status"] = processed_data["grid_status_calculated"]
+
+       return attrs
 
    @property
    def native_value(self):

@@ -700,6 +700,8 @@ class SajApiClient:
                         load_power = float(latest.get("loadPower", 0))
                         _LOGGER.debug("Load monitoring loadPower: %s", load_power)
                         processed["home_load_power"] = load_power
+                        processed["home_load_power_source"] = "sec"
+                        processed["home_load_power_estimated"] = False
                     except (ValueError, TypeError):
                         pass
             elif not is_nighttime:
@@ -711,15 +713,19 @@ class SajApiClient:
                     explicit_load = float(data.get("totalLoadPowerWatt") or data.get("sysTotalLoadWatt") or 0)
                     if explicit_load > 0:
                         processed["home_load_power"] = explicit_load
+                        processed["home_load_power_source"] = "inverter"
+                        processed["home_load_power_estimated"] = False
                     else:
                         pv_power = float(data.get("totalPVPower", processed.get("total_pv_power_calculated", 0)) or 0)
                         grid_abs = float(processed.get("grid_power_abs", abs(float(data.get("totalGridPowerWatt", 0) or 0))))
                         grid_status = processed.get("grid_status_calculated")
                         if grid_status == "exporting":
                             processed["home_load_power"] = max(pv_power - grid_abs, 0)
+                            processed["home_load_power_source"] = "estimated_pv_grid"
                             processed["home_load_power_estimated"] = True
                         elif grid_status == "importing":
                             processed["home_load_power"] = max(pv_power + grid_abs, 0)
+                            processed["home_load_power_source"] = "estimated_pv_grid"
                             processed["home_load_power_estimated"] = True
                 except (ValueError, TypeError):
                     pass
