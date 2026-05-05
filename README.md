@@ -10,6 +10,9 @@ A Home Assistant custom component for monitoring SAJ solar inverters and battery
 - View real-time power generation, grid status, and battery information
 - Track daily and total energy production
 - Monitor home load power and self-consumption
+- Use eSolar SEC plant load-monitoring data as the preferred source for home load when available
+- Track SEC data freshness, self-consumed solar energy, self-consumption rate, and solar offset rate
+- Estimate daily TNB Domestic ToU + NEM cost from SEC import/export energy using a bill-derived blended model
 - Support for both solar inverters and battery systems
 - Automatic detection of nighttime mode for solar inverters
 - Environmental impact statistics (CO2 reduction, equivalent trees)
@@ -115,6 +118,10 @@ The integration provides the following sensors:
 - Operating Status
 - Home Load Power
 
+When eSolar SEC load-monitoring data is available, Home Load Power includes source metadata:
+- `source: sec` and `estimated: false` for official SEC load data
+- fallback/estimated source attributes when inverter-derived estimates are used
+
 ### Solar Inverter Specific Sensors
 - PV1/PV2 Power, Voltage, and Current
 - Grid Phase (R, S, T) Power, Voltage, Current, and Frequency
@@ -136,6 +143,27 @@ The integration provides the following sensors:
 - Estimated Annual Production
 - Estimated Annual Savings
 
+### eSolar SEC / Load-Monitoring Sensors
+
+For plants with an eSolar SEC module and working plant-level `secData` access, the integration exposes additional load and self-consumption sensors:
+
+- SEC Last Data Time
+- SEC Data Age
+- SEC Load Self Consumed Energy
+- SEC Self Consumption Rate
+- SEC Solar Offset Rate
+- Estimated TNB ToU NEM Cost Today
+
+The TNB cost sensor is intentionally marked as an estimate. The SAJ SEC endpoint currently provides daily total import/export energy, but not peak/off-peak bucketed energy. The integration therefore uses a configurable/bill-derived blended Domestic ToU + NEM model rather than claiming to reproduce the exact monthly TNB bill.
+
+The cost estimate includes:
+- import energy from SEC `buyEnergy`
+- export/NEM credit from SEC `sellEnergy`
+- peak/off-peak blended energy rate
+- AFA, capacity, network, retail, service tax, and KWTBB assumptions
+
+The payable value is floored at RM0 so a high-export day does not show a negative bill payable.
+
 ## Troubleshooting
 
 If you encounter any issues:
@@ -147,11 +175,21 @@ If you encounter any issues:
 5. Ensure your developer account has permissions to access the devices you're trying to monitor
 6. Restart Home Assistant after making changes to the integration
 
+For eSolar SEC users:
+- Use the plant-level `secData` endpoint for official load-monitoring data.
+- Continue using the inverter/device SN for realtime, history, and device-info endpoints.
+- Do not assume the SEC module SN itself will work with realtime/history APIs; some accounts return authorization or "No inverter with this SN" errors for direct SEC SN calls even when plant-level `secData` works.
+- Check the Home Load Power entity attributes to confirm whether the value is official SEC data (`source: sec`, `estimated: false`) or an inverter-derived fallback estimate.
+
 If you receive authentication errors, you may need to:
 - Check if your developer account is still active
 - Re-authorize your resources in the Elekeeper portal
 - Verify you're using the international node: https://intl-developer.saj-electric.com (for international users except Europe)
 - European users should use: https://developer.electric.com
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for release notes and version history.
 
 ## Reporting Issues
 
